@@ -23,7 +23,19 @@ repositories {
     maven {
         url = 'https://artifacts.consensys.net/public/maven/maven/'
         content { includeGroupByRegex('tech\\.pegasys(\\..*)?') }
-    }}
+    }
+    //mavenLocal()
+
+    // temporarily using garyschulte:besu-native releases until CI builds all arch and static artifacts
+    def garyschulteBesuNative =   ivy {
+        url = 'https://github.com'
+        patternLayout {
+            // Hard-code the GitHub repo path; use the Gradle module name as the artifact base
+            artifact '/garyschulte/besu-native/releases/download/v[revision]/[module]-[revision](-[classifier]).[ext]'
+        }
+        metadataSources { artifact() } // artifact-only, no pom/ivy
+    }
+}
 
 apply from: "${rootDir}/gradle/versions.gradle"
 
@@ -36,24 +48,116 @@ java {
 }
 
 application {
-    mainClass = 'org.hyperledger.besu.riscv.poc.GenR1TestCase'
+    mainClass = 'org.hyperledger.besu.riscv.poc.NativeImageTestRunner'
+}
+
+// Task to extract native libraries from gnark static JAR
+tasks.register('extractGnarkNativeLibs', Copy) {
+    def gnarkConfig = configurations.runtimeClasspath
+    def gnarkStaticJar = gnarkConfig.files.find { it.name.contains('gnark') && it.name.contains('static') }
+
+    if (gnarkStaticJar) {
+        from(zipTree(gnarkStaticJar)) {
+            include 'lib/**/*.a'
+            include 'lib/**/*.h'
+        }
+        into layout.buildDirectory.dir('native-libs')
+    }
+}
+
+// Detect platform for library path, with override for cross-compilation
+def detectPlatform() {
+    // Check for explicit override first (for cross-compilation via Gradle project property)
+    def overrideArch = project.findProperty('CROSS_COMPILE_ARCH')
+    if (overrideArch) {
+        println "Using cross-compile architecture override: ${overrideArch}"
+        return overrideArch
+    }
+
+    // Auto-detect based on current platform
+    def osName = System.getProperty('os.name').toLowerCase()
+    def osArch = System.getProperty('os.arch').toLowerCase()
+
+    if (osName.contains('mac')) {
+        if (osArch.contains('aarch64') || osArch.contains('arm')) {
+            return 'aarch64'
+        } else {
+            return 'x86-64'
+        }
+    } else if (osName.contains('linux')) {
+        if (osArch.contains('aarch64') || osArch.contains('arm')) {
+            return 'aarch64'
+        } else if (osArch.contains('riscv')) {
+            return 'riscv64'
+        } else {
+            return 'x86-64'
+        }
+    }
+    return 'x86-64' // default
 }
 
 graalvmNative {
     binaries {
         main {
-            imageName = 'genr1testcase'
-            mainClass = 'org.hyperledger.besu.riscv.poc.GenR1TestCase'
+            imageName = 'nativeImageTestRunner'
+            mainClass = 'org.hyperledger.besu.riscv.poc.NativeImageTestRunner'
+
+            // Use specific GraalVM installation
+            javaLauncher = javaToolchains.launcherFor {
+                languageVersion = JavaLanguageVersion.of(21)
+                vendor = JvmVendorSpec.GRAAL_VM
+            }
+
             buildArgs.add('--verbose')
             buildArgs.add('--no-fallback')
             buildArgs.add('-H:+ReportExceptionStackTraces')
             buildArgs.add('--enable-all-security-services')
             buildArgs.add('--initialize-at-run-time=org.bouncycastle.jcajce.provider.drbg.DRBG$Default,org.bouncycastle.jcajce.provider.drbg.DRBG$NonceAndIV')
             buildArgs.add('-H:+AddAllCharsets')
+
+            // Add paths for static libraries
+            def platform = detectPlatform()
+            def nativeLibDir = layout.buildDirectory.dir("native-libs/lib/${platform}").get().asFile
+            buildArgs.add("-H:CLibraryPath=${nativeLibDir.absolutePath}")
+
+            // Link against the gnark static libraries
+            buildArgs.add("-H:NativeLinkerOption=-lgnark_jni")
+            buildArgs.add("-H:NativeLinkerOption=-lgnark_eip_196")
+            buildArgs.add("-H:NativeLinkerOption=-lgnark_eip_2537")
+
+            // Honor NATIVE_IMAGE_OPTIONS project property (passed via -PNATIVE_IMAGE_OPTIONS="...")
+            // This is used for cross-compilation with LLVM backend or other experimental options
+            def nativeImageOptions = project.findProperty('NATIVE_IMAGE_OPTIONS')
+
+            println "=========================================="
+            println "GraalVM Native Image Build Configuration"
+            println "Target platform: ${platform}"
+            println "CROSS_COMPILE_ARCH property: '${project.findProperty('CROSS_COMPILE_ARCH')}'"
+            println "NATIVE_IMAGE_OPTIONS property: '${nativeImageOptions}'"
+
+            if (nativeImageOptions) {
+                println "Parsing and adding NATIVE_IMAGE_OPTIONS to buildArgs"
+                def parsedOptions = nativeImageOptions.toString().trim().split(/\s+/)
+                parsedOptions.each { option ->
+                    if (option && !option.isEmpty()) {
+                        println "  Adding: ${option}"
+                        buildArgs.add(option)
+                    }
+                }
+            } else {
+                println "NATIVE_IMAGE_OPTIONS not set (use -PNATIVE_IMAGE_OPTIONS=\"...\" to set)"
+            }
+            println "Total buildArgs count: ${buildArgs.size()}"
+            println "=========================================="
         }
     }
 
-    toolchainDetection = true
+    toolchainDetection = false
+}
+
+// Make nativeCompile depend on extracting the libraries
+tasks.named('nativeCompile') {
+    dependsOn 'extractGnarkNativeLibs'
 }
 
 tasks.withType(JavaCompile) {
