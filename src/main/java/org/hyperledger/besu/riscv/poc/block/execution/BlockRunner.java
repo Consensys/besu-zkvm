@@ -17,6 +17,9 @@ import static org.hyperledger.besu.ethereum.trie.pathbased.common.storage.PathBa
 
 import org.hyperledger.besu.config.GenesisConfig;
 import org.hyperledger.besu.consensus.merge.PostMergeContext;
+import org.hyperledger.besu.crypto.SignatureAlgorithm;
+import org.hyperledger.besu.crypto.SignatureAlgorithmFactory;
+import org.hyperledger.besu.datatypes.Address;
 import org.hyperledger.besu.datatypes.Hash;
 import org.hyperledger.besu.ethereum.BlockProcessingResult;
 import org.hyperledger.besu.ethereum.ProtocolContext;
@@ -44,13 +47,18 @@ import org.hyperledger.besu.ethereum.trie.pathbased.bonsai.cache.CodeCache;
 import org.hyperledger.besu.ethereum.trie.pathbased.bonsai.cache.NoopBonsaiCachedMerkleTrieLoader;
 import org.hyperledger.besu.ethereum.trie.pathbased.bonsai.storage.BonsaiWorldStateKeyValueStorage;
 import org.hyperledger.besu.ethereum.worldstate.DataStorageConfiguration;
+import org.hyperledger.besu.evm.gascalculator.GasCalculator;
 import org.hyperledger.besu.evm.internal.EvmConfiguration;
+import org.hyperledger.besu.evm.precompile.PrecompileContractRegistry;
 import org.hyperledger.besu.metrics.noop.NoOpMetricsSystem;
 import org.hyperledger.besu.plugin.ServiceManager;
 import org.hyperledger.besu.plugin.services.BesuService;
+import org.hyperledger.besu.riscv.poc.crypto.SECP256K1Graal;
+import org.hyperledger.besu.riscv.poc.evm.precompiles.GraalECRECPrecompiledContract;
 import org.hyperledger.besu.services.kvstore.InMemoryKeyValueStorage;
 import org.hyperledger.besu.services.kvstore.SegmentedInMemoryKeyValueStorage;
 
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -234,6 +242,15 @@ public class BlockRunner {
             .withServiceManager(serviceManager)
             .build();
 
+    // TODO: it would be better to implement a lean protocol schedule with its own precompile registry
+    //       but here we just overwrite the precompileRegistry entries to use the graal-specific
+    //       ones.  Longer term, this would probably be zkvm specific configs using eCalls.  but
+    //       for now, keep-it-simple:
+    final ProtocolSpec spec = protocolSchedule
+        .getByBlockHeader(blockchain.getChainHeadHeader());
+    final PrecompileContractRegistry registry = spec.getPrecompileContractRegistry();
+    decoratePrecompiles(registry, spec.getGasCalculator());
+
     return new BlockRunner(protocolSchedule, protocolContext, blockchain);
   }
 
@@ -270,6 +287,10 @@ public class BlockRunner {
     updater.setChainHead(previousHash);
     updater.putTotalDifficulty(previousHash, Difficulty.ZERO);
     return previous;
+  }
+
+  static private void decoratePrecompiles(PrecompileContractRegistry registry, GasCalculator calc) {
+    registry.put(Address.ECREC, new GraalECRECPrecompiledContract(calc));
   }
 
   private BlockRunner(
@@ -395,7 +416,7 @@ public class BlockRunner {
     try (var inputStream = BlockRunner.class.getResourceAsStream(path)) {
       if (inputStream != null) {
         System.out.println("Loading from classpath: " + path);
-        return new String(inputStream.readAllBytes());
+        return new String(inputStream.readAllBytes(), Charset.defaultCharset());
       }
     }
     // Fall back to filesystem
@@ -406,6 +427,12 @@ public class BlockRunner {
   public static void main(final String[] args) {
     System.out.println("Starting BlockRunner .");
     CommandLineArgs cmdArgs = parseArguments(args);
+
+    // set graal signature algorithm:
+    SignatureAlgorithm graalSig = new SECP256K1Graal();
+    graalSig.maybeEnableNative();
+    SignatureAlgorithmFactory.setInstance(graalSig);
+
     try {
       ObjectMapper objectMapper = new ObjectMapper();
 
