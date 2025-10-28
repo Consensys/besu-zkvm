@@ -17,6 +17,8 @@ import static org.hyperledger.besu.ethereum.trie.pathbased.common.storage.PathBa
 
 import org.hyperledger.besu.config.GenesisConfig;
 import org.hyperledger.besu.consensus.merge.PostMergeContext;
+import org.hyperledger.besu.crypto.SignatureAlgorithm;
+import org.hyperledger.besu.crypto.SignatureAlgorithmFactory;
 import org.hyperledger.besu.datatypes.Hash;
 import org.hyperledger.besu.ethereum.BlockProcessingResult;
 import org.hyperledger.besu.ethereum.ProtocolContext;
@@ -48,9 +50,11 @@ import org.hyperledger.besu.evm.internal.EvmConfiguration;
 import org.hyperledger.besu.metrics.noop.NoOpMetricsSystem;
 import org.hyperledger.besu.plugin.ServiceManager;
 import org.hyperledger.besu.plugin.services.BesuService;
+import org.hyperledger.besu.riscv.poc.crypto.SECP256K1Graal;
 import org.hyperledger.besu.services.kvstore.InMemoryKeyValueStorage;
 import org.hyperledger.besu.services.kvstore.SegmentedInMemoryKeyValueStorage;
 
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -80,12 +84,23 @@ public class BlockRunner {
       Optional<String> blockRlpPath,
       Optional<String> genesisConfigPath) {}
 
-  /**
-   * Factory method that builds a complete in-memory Besu execution environment. It imports previous
-   * headers, reconstructs the world state from a witness, and returns a {@link BlockRunner} ready
-   * to process a block.
-   */
+  private static final NoOpMetricsSystem noOpMetricsSystem = new NoOpMetricsSystem();
+
+  // Configure the EVM with in-memory (stacked) world updater mode.
+  private static final EvmConfiguration evmConfiguration =
+      new EvmConfiguration(
+          EvmConfiguration.DEFAULT.jumpDestCacheWeightKB(),
+          EvmConfiguration.WorldUpdaterMode.STACKED,
+          true);
+  /*
+
+    /**
+     * Factory method that builds a complete in-memory Besu execution environment. It imports previous
+     * headers, reconstructs the world state from a witness, and returns a {@link BlockRunner} ready
+     * to process a block.
+     */
   public static BlockRunner create(
+      final BlockHeader targetBlockHeader,
       final List<BlockHeader> prevHeaders,
       final Map<Hash, Bytes> trieNodes,
       final Map<Hash, Bytes> codes,
@@ -93,25 +108,12 @@ public class BlockRunner {
 
     final GenesisConfig genesisConfig = GenesisConfig.fromConfig(genesisConfigJson);
 
-    final NoOpMetricsSystem noOpMetricsSystem = new NoOpMetricsSystem();
+    // use a minimal protocol schedule:
+    final ProtocolSchedule protocolSchedule = constructMinimalConfig(genesisConfig, targetBlockHeader);
 
-    // Configure the EVM with in-memory (stacked) world updater mode.
-    final EvmConfiguration evmConfiguration =
-        new EvmConfiguration(
-            EvmConfiguration.DEFAULT.jumpDestCacheWeightKB(),
-            EvmConfiguration.WorldUpdaterMode.STACKED,
-            true);
-
-    // Build the mainnet protocol schedule based on the genesis config.
-    final ProtocolSchedule protocolSchedule =
-        MainnetProtocolSchedule.fromConfig(
-            genesisConfig.getConfigOptions(),
-            evmConfiguration,
-            MiningConfiguration.MINING_DISABLED,
-            new BadBlockManager(),
-            false,
-            false,
-            noOpMetricsSystem);
+    //TODO: possibly make minimal vs mainnet protocol schedule configurable
+//    // or use the mainnet-derived protocol schedule
+//    final ProtocolSchedule protocolSchedule = constructFromGenesisConfig(genesisConfig);
 
     // Construct the genesis state and world state root.
     final GenesisState genesisState =
@@ -234,6 +236,8 @@ public class BlockRunner {
             .withServiceManager(serviceManager)
             .build();
 
+    // The MinimalProtocolSchedule already created the correct precompile registry
+    // with Graal-native implementations, so no additional decoration is needed.
     return new BlockRunner(protocolSchedule, protocolContext, blockchain);
   }
 
@@ -337,6 +341,33 @@ public class BlockRunner {
     System.out.println("  Stateroot: " + result.getYield().get().getWorldState().rootHash());
   }
 
+  private static ProtocolSchedule constructMinimalConfig(
+      GenesisConfig genesisConfig,
+      BlockHeader targetBlockHeader) {
+    return MinimalProtocolSchedule.create(
+            targetBlockHeader,
+            genesisConfig,
+            evmConfiguration,
+            new BadBlockManager(),
+            noOpMetricsSystem);
+
+  }
+
+  private static ProtocolSchedule constructFromGenesisConfig(
+      final GenesisConfig genesisConfig) {
+    // Build the mainnet protocol schedule based on the genesis config.
+    return
+        MainnetProtocolSchedule.fromConfig(
+            genesisConfig.getConfigOptions(),
+            evmConfiguration,
+            MiningConfiguration.MINING_DISABLED,
+            new BadBlockManager(),
+            false,
+            false,
+            noOpMetricsSystem);
+
+
+  }
   /** Print usage information and exit. */
   private static void printUsageAndExit() {
     System.out.println("Usage: BlockRunner [OPTIONS]");
@@ -402,7 +433,7 @@ public class BlockRunner {
     try (var inputStream = BlockRunner.class.getResourceAsStream(path)) {
       if (inputStream != null) {
         System.out.println("Loading from classpath: " + path);
-        return new String(inputStream.readAllBytes());
+        return new String(inputStream.readAllBytes(), Charset.defaultCharset());
       }
     }
     // Fall back to filesystem
@@ -415,6 +446,12 @@ public class BlockRunner {
 
     System.out.println("Starting BlockRunner .");
     CommandLineArgs cmdArgs = parseArguments(args);
+
+    // set graal signature algorithm:
+    SignatureAlgorithm graalSig = new SECP256K1Graal();
+    graalSig.maybeEnableNative();
+    SignatureAlgorithmFactory.setInstance(graalSig);
+
     try {
       ObjectMapper objectMapper = new ObjectMapper();
 
@@ -481,7 +518,8 @@ public class BlockRunner {
       System.out.println(String.format("\n✓ Setup completed in %.2f ms\n", setupTimeMs));
 
       final BlockRunner runner =
-          BlockRunner.create(previousHeaders, trieNodes, codes, genesisConfigJson);
+          BlockRunner.create(
+              blockToImport.getHeader(), previousHeaders, trieNodes, codes, genesisConfigJson);
 
       runner.processBlock(blockToImport);
 
